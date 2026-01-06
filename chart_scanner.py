@@ -8,22 +8,25 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QTableWidget, 
                              QTableWidgetItem, QGroupBox, QCheckBox, QDoubleSpinBox, 
                              QTextEdit, QMessageBox, QHeaderView, QScrollArea, 
-                             QSplitter, QGridLayout)  # <--- Added QGridLayout here
+                             QSplitter, QGridLayout, QMenu)
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor, QFont, QAction
 
 # ==========================================
 # 1️⃣ CONFIGURATION
 # ==========================================
 class PropGuardConfig:
     ASSETS = {
-        "FOREX": ["EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCHF"],
-        "INDICES": ["US30", "NAS100", "GER40"],
+        # Add your crosses here inside the brackets!
+        "FOREX": [
+            "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCHF",
+            "GBPJPY", "EURJPY", "EURAUD", "GBPAUD", "EURGBP", "AUDJPY"  # <--- Added these
+        ],
+        "INDICES": ["US30", "NAS100", "GER40", "SPX500"],
         "METALS": ["XAUUSD", "XAGUSD"],
         "ENERGY": ["USOIL", "UKOIL"],
-        "CRYPTO": ["BTCUSD", "ETHUSD"]
+        "CRYPTO": ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"]
     }
-    # Analysis Settings
     ATR_PERIOD = 14
     ATR_MULTIPLIER = 1.5
     LOOKBACK = 20
@@ -32,7 +35,7 @@ class PropGuardConfig:
     ADX_PERIOD = 14
 
 # ==========================================
-# 2️⃣ QUANT ENGINE (THE MATH CORE)
+# 2️⃣ QUANT ENGINE
 # ==========================================
 class ScannerWorker(QThread):
     log_signal = pyqtSignal(str, str)
@@ -61,7 +64,7 @@ class ScannerWorker(QThread):
         
         self.initial_equity = mt5.account_info().equity
         self.is_running = True
-        self.log_signal.emit("✅ Scanner Started. Calculating Probabilities...", "lime")
+        self.log_signal.emit("✅ Scanner Started. Analyzing...", "lime")
 
         while self.is_running:
             acct = mt5.account_info()
@@ -78,7 +81,6 @@ class ScannerWorker(QThread):
                 data = self.analyze_symbol(symbol)
                 if data: opportunities.append(data)
             
-            # Sort by Score
             opportunities.sort(key=lambda x: x['score'], reverse=True)
             timestamp = datetime.now().strftime("%H:%M:%S")
             self.scanner_signal.emit(opportunities, timestamp)
@@ -89,24 +91,17 @@ class ScannerWorker(QThread):
         self.log_signal.emit("⛔ Scanner Stopped", "orange")
 
     def analyze_symbol(self, symbol):
-        """
-        🔥 QUANT-LEVEL SCORING LOGIC 🔥
-        """
         try:
-            # 1. Data Fetch
             bars = 250
             rates = mt5.copy_rates_from_pos(symbol, self.timeframe, 0, bars)
             if rates is None or len(rates) < bars: return None
             
             df = pd.DataFrame(rates)
-            
-            # 2. Indicator Calculation
             df['ema'] = df.ta.ema(length=PropGuardConfig.EMA_PERIOD)
             df['atr'] = df.ta.atr(length=PropGuardConfig.ATR_PERIOD)
             df['rsi'] = df.ta.rsi(length=PropGuardConfig.RSI_PERIOD)
             adx_obj = df.ta.adx(length=PropGuardConfig.ADX_PERIOD)
             df['adx'] = adx_obj[f"ADX_{PropGuardConfig.ADX_PERIOD}"]
-            
             donchian = df.ta.donchian(lower_length=PropGuardConfig.LOOKBACK, upper_length=PropGuardConfig.LOOKBACK)
             df = pd.concat([df, donchian], axis=1)
             
@@ -114,77 +109,36 @@ class ScannerWorker(QThread):
             tick = mt5.symbol_info_tick(symbol)
             if not tick: return None
 
-            # 3. Determine Bias
             bias = "NEUTRAL"
             if curr['close'] > curr['ema']: bias = "BULLISH"
             elif curr['close'] < curr['ema']: bias = "BEARISH"
 
-            # ==========================================
-            # 🧠 SCORING COMPONENT MATHEMATICS
-            # ==========================================
-            
-            # A. Trend Strength (30%)
-            # Logic: Distance from EMA + ADX Power
+            # SCORING
             ema_dist = abs(curr['close'] - curr['ema'])
-            # Normalize: If price is > 2 ATRs away from EMA, trend is maxed out
             trend_str = min(ema_dist / (curr['atr'] * 2.0), 1.0)
-            # ADX: Normalize 20-45 range to 0-1
             adx_norm = min(max((curr['adx'] - 20) / 25, 0), 1)
-            
             score_trend = (0.6 * trend_str) + (0.4 * adx_norm)
 
-            # B. Momentum Alignment (20%)
-            # Logic: RSI Curves. 
-            # Bullish: Reward 50-75. Bearish: Reward 25-50.
             score_mom = 0.0
-            if bias == "BULLISH":
-                # Peak score at RSI 75, fade after
-                score_mom = max(min((curr['rsi'] - 50) / 25, 1), 0)
-            elif bias == "BEARISH":
-                # Peak score at RSI 25
-                score_mom = max(min((50 - curr['rsi']) / 25, 1), 0)
+            if bias == "BULLISH": score_mom = max(min((curr['rsi'] - 50) / 25, 1), 0)
+            elif bias == "BEARISH": score_mom = max(min((50 - curr['rsi']) / 25, 1), 0)
 
-            # C. Volatility Quality (15%)
-            # Logic: Avoid dead markets. Reward healthy ATR%
             atr_pct = curr['atr'] / curr['close']
-            # Target 0.05% to 0.25% daily range
             score_vol = min(max((atr_pct - 0.0005) / 0.002, 0), 1)
 
-            # D. Structure Proximity (25%)
-            # Logic: Distance to Donchian Channel
-            # Closer to breakout = Higher Score
             dcu = curr[f"DCU_{PropGuardConfig.LOOKBACK}_{PropGuardConfig.LOOKBACK}"]
             dcl = curr[f"DCL_{PropGuardConfig.LOOKBACK}_{PropGuardConfig.LOOKBACK}"]
-            
-            dist_to_break = 0.0
-            if bias == "BULLISH": dist_to_break = abs(dcu - tick.ask)
-            else: dist_to_break = abs(tick.bid - dcl)
-            
-            # If distance is > 1.5 ATR, score is 0. If 0, score is 1.
+            dist_to_break = abs(dcu - tick.ask) if bias == "BULLISH" else abs(tick.bid - dcl)
             score_struct = 1.0 - min(dist_to_break / (curr['atr'] * 1.5), 1.0)
 
-            # E. Liquidity Quality (10%)
-            # Logic: Spread vs ATR.
             sym_info = mt5.symbol_info(symbol)
             spread_points = (tick.ask - tick.bid) / sym_info.point
             atr_points = curr['atr'] / sym_info.point
-            
-            # Strict: If spread > 20% of ATR, score drops to 0.
             score_liq = max(1.0 - (spread_points / (atr_points * 0.2)), 0.0)
 
-            # ==========================================
-            # 🏁 FINAL WEIGHTED SCORE
-            # ==========================================
-            final_score = 100 * (
-                (0.30 * score_trend) +
-                (0.20 * score_mom) +
-                (0.15 * score_vol) +
-                (0.25 * score_struct) +
-                (0.10 * score_liq)
-            )
+            final_score = 100 * ((0.30 * score_trend) + (0.20 * score_mom) + (0.15 * score_vol) + (0.25 * score_struct) + (0.10 * score_liq))
             final_score = round(final_score, 1)
 
-            # --- Trade Setup Calculations ---
             if bias == "BULLISH":
                 entry = tick.ask
                 sl = entry - (curr['atr'] * PropGuardConfig.ATR_MULTIPLIER)
@@ -198,41 +152,32 @@ class ScannerWorker(QThread):
             lot_size = self.calculate_lot(symbol, sl_points)
 
             return {
-                "symbol": symbol,
-                "score": final_score,
-                "bias": bias,
-                "price": entry,
-                "sl": sl,
-                "tp": tp,
-                "lots": lot_size,
-                "adx": curr['adx']
+                "symbol": symbol, "score": final_score, "bias": bias, "price": entry, "sl": sl, "tp": tp, 
+                "lots": lot_size, "adx": curr['adx'], "rsi": curr['rsi'], "atr": curr['atr'], 
+                "spread": spread_points, "ema_dist": trend_str
             }
-        except Exception as e:
-            # print(f"Error analyzing {symbol}: {e}")
+        except Exception:
             return None
 
     def calculate_lot(self, symbol, sl_points):
         balance = mt5.account_info().balance
         risk_money = balance * (self.risk_per_trade / 100.0)
-        
         sym_info = mt5.symbol_info(symbol)
         if not sym_info: return 0.0
-        
         tick_value = sym_info.trade_tick_value
         if tick_value == 0 or sl_points == 0: return 0.0
-        
         raw_lot = risk_money / (sl_points * tick_value)
         step = sym_info.volume_step
         lot = round(raw_lot / step) * step
         return max(lot, sym_info.volume_min) if lot <= sym_info.volume_max else sym_info.volume_max
 
 # ==========================================
-# 3️⃣ GUI (THE COCKPIT)
+# 3️⃣ GUI
 # ==========================================
 class ScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🛡️ PROP-FIRM QUANT SCANNER v6.1")
+        self.setWindowTitle("🛡️ PROP-FIRM QUANT SCANNER v6.2 (AI Bridge)")
         self.setGeometry(100, 100, 1450, 950)
         self.setStyleSheet(self.get_style())
         
@@ -243,6 +188,7 @@ class ScannerGUI(QMainWindow):
         
         self.selected_symbols = set()
         self.previous_scores = {} 
+        self.latest_data_map = {} # Store full data for AI prompt
         
         w = QWidget()
         self.setCentralWidget(w)
@@ -287,7 +233,6 @@ class ScannerGUI(QMainWindow):
     def create_main_area(self, parent):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        # LEFT: Markets
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMinimumWidth(320)
@@ -311,34 +256,27 @@ class ScannerGUI(QMainWindow):
         scroll.setWidget(left_widget)
         splitter.addWidget(scroll)
         
-        # RIGHT: Table
         self.table = QTableWidget()
         self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels(["Symbol", "Score", "Trend", "Signal", "Entry", "SL", "TP", "Lot Size"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        
+        # Enable Right Click Context Menu
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.open_context_menu)
+        
         splitter.addWidget(self.table)
         splitter.setSizes([350, 1050])
         parent.addWidget(splitter, 1)
 
     def create_legend(self, parent):
-        grp = QGroupBox("📋 Quant Score Guide (Normalized 0-100)")
+        grp = QGroupBox("📋 Quant Score Guide")
         grp.setMaximumHeight(80)
         layout = QHBoxLayout(grp)
-        
-        # Updated Logic Legend
-        l1 = QLabel("🟩 85-100: INSTITUTIONAL (High Prob)")
-        l1.setStyleSheet("color: #00ff00; font-weight: bold; background: #0a2a0a; padding: 5px; border-radius: 4px;")
-        layout.addWidget(l1)
-        
-        l2 = QLabel("🟨 70-84: VALID SETUP (Check Chart)")
-        l2.setStyleSheet("color: #ffff00; font-weight: bold; background: #2a2a0a; padding: 5px; border-radius: 4px;")
-        layout.addWidget(l2)
-        
-        l3 = QLabel("🟥 <70: WEAK / NOISE")
-        l3.setStyleSheet("color: #ff4444; font-weight: bold; background: #2a0a0a; padding: 5px; border-radius: 4px;")
-        layout.addWidget(l3)
-        
-        layout.addStretch()
+        l1 = QLabel("🟩 85-100: INSTITUTIONAL"); l1.setStyleSheet("color: #0f0; font-weight: bold;")
+        l2 = QLabel("🟨 70-84: VALID SETUP"); l2.setStyleSheet("color: #ff0; font-weight: bold;")
+        l3 = QLabel("🟥 <70: WEAK"); l3.setStyleSheet("color: #f44; font-weight: bold;")
+        layout.addWidget(l1); layout.addWidget(l2); layout.addWidget(l3); layout.addStretch()
         parent.addWidget(grp)
 
     def create_log_area(self, parent):
@@ -365,62 +303,74 @@ class ScannerGUI(QMainWindow):
             self.btn_scan.setText("▶ START SCANNER")
             self.btn_scan.setStyleSheet("background-color: #006400;")
 
+    # 🆕 AI BRIDGE FUNCTIONALITY
+    def open_context_menu(self, position):
+        row = self.table.rowAt(position.y())
+        if row == -1: return
+        
+        sym_item = self.table.item(row, 0)
+        if not sym_item: return
+        symbol = sym_item.text()
+        
+        menu = QMenu()
+        copy_ai_action = QAction(f"📋 Copy '{symbol}' AI Prompt", self)
+        copy_ai_action.triggered.connect(lambda: self.copy_for_ai(symbol))
+        menu.addAction(copy_ai_action)
+        menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def copy_for_ai(self, symbol):
+        data = self.latest_data_map.get(symbol)
+        if not data: return
+        
+        prompt = (
+            f"Gemini, analyze this live potential setup for {symbol}:\n"
+            f"- Quant Score: {data['score']}/100\n"
+            f"- Bias: {data['bias']}\n"
+            f"- ADX Strength: {data['adx']:.1f}\n"
+            f"- RSI Momentum: {data['rsi']:.1f}\n"
+            f"- Trend Strength (0-1): {data.get('ema_dist', 0):.2f}\n"
+            f"- Spread: {data.get('spread', 0):.1f} points\n"
+            f"Based on this data, is this a high-probability entry for a scalper?"
+        )
+        QApplication.clipboard().setText(prompt)
+        self.log(f"📋 AI Prompt for {symbol} copied to clipboard!", "cyan")
+
     @pyqtSlot(list, str)
     def update_table(self, opportunities, timestamp):
         self.lbl_update.setText(f"Last Scan: {timestamp} ●")
         self.lbl_update.setStyleSheet("color: #00ff00; font-family: Consolas; font-weight: bold;")
-        
         self.table.setRowCount(0)
+        
         for row, data in enumerate(opportunities):
             self.table.insertRow(row)
-            
             sym = data['symbol']
-            score = data['score']
+            self.latest_data_map[sym] = data # Store for AI Prompt
             
+            score = data['score']
             prev_score = self.previous_scores.get(sym, score)
-            arrow = ""
-            if score > prev_score: arrow = " ▲"
-            elif score < prev_score: arrow = " ▼"
+            arrow = " ▲" if score > prev_score else " ▼" if score < prev_score else ""
             self.previous_scores[sym] = score 
             
             self.table.setItem(row, 0, QTableWidgetItem(sym))
             
-            score_text = f"{score}{arrow}"
-            score_item = QTableWidgetItem(score_text)
+            score_item = QTableWidgetItem(f"{score}{arrow}")
             score_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            
-            # UPDATED COLOR THRESHOLDS
-            if score >= 85:
-                score_item.setBackground(QColor("#00ff00")) # Bright Green
-                score_item.setForeground(QColor("#000000")) 
-            elif score >= 70:
-                score_item.setBackground(QColor("#555500")) # Olive
-            else:
-                score_item.setBackground(QColor("#330000")) # Dark Red
+            bg = "#00ff00" if score >= 85 else "#555500" if score >= 70 else "#330000"
+            fg = "#000000" if score >= 85 else "#e0e0e0"
+            score_item.setBackground(QColor(bg)); score_item.setForeground(QColor(fg))
             self.table.setItem(row, 1, score_item)
             
             self.table.setItem(row, 2, QTableWidgetItem(f"{data['bias']} (ADX:{data['adx']:.0f})"))
             
-            sig_text = "WAIT"
-            sig_bg = QColor(0,0,0,0)
-            if score >= 85:
-                sig_text = "🔥 TRADE NOW"
-                sig_bg = QColor("#004400") 
-            elif score >= 70:
-                sig_text = "👀 WATCH"
-            
-            sig_item = QTableWidgetItem(sig_text)
-            sig_item.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-            if score >= 85: sig_item.setBackground(sig_bg)
-            self.table.setItem(row, 3, sig_item)
+            sig = "🔥 TRADE" if score >= 85 else "👀 WATCH" if score >= 70 else "WAIT"
+            self.table.setItem(row, 3, QTableWidgetItem(sig))
             
             self.table.setItem(row, 4, QTableWidgetItem(f"{data['price']:.5f}"))
             self.table.setItem(row, 5, QTableWidgetItem(f"{data['sl']:.5f}"))
             self.table.setItem(row, 6, QTableWidgetItem(f"{data['tp']:.5f}"))
             
             lot_item = QTableWidgetItem(str(data['lots']))
-            lot_item.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-            lot_item.setForeground(QColor("#00ffff"))
+            lot_item.setForeground(QColor("#00ffff")); lot_item.setFont(QFont("Arial", 10, QFont.Weight.Bold))
             self.table.setItem(row, 7, lot_item)
 
     @pyqtSlot(str, str)
